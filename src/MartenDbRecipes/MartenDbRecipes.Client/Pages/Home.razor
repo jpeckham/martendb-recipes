@@ -1,0 +1,197 @@
+@page "/"
+@inject HttpClient Http
+
+<PageTitle>Marten DB Recipes</PageTitle>
+
+<div class="recipe-shell">
+    <section class="recipe-hero">
+        <div>
+            <p class="eyebrow">.NET 10 minimal API + Blazor WebAssembly</p>
+            <h1>Marten DB Recipes</h1>
+            <p class="hero-copy">
+                A runnable set of Marten examples for documents, event streams, CQRS read models, and subscription-style background processing.
+            </p>
+        </div>
+        <button class="btn btn-primary" @onclick="RunTicketFlow" disabled="@busy">
+            @(busy ? "Running..." : "Run Ticket Flow")
+        </button>
+    </section>
+
+    @if (!string.IsNullOrWhiteSpace(error))
+    {
+        <div class="alert alert-danger">@error</div>
+    }
+
+    <section class="recipe-grid">
+        @foreach (var recipe in recipes)
+        {
+            <article class="recipe-card">
+                <h2>@recipe.Title</h2>
+                <p>@recipe.Solves</p>
+                <dl>
+                    <dt>Marten feature</dt>
+                    <dd>@recipe.MartenFeature</dd>
+                    <dt>Try it</dt>
+                    <dd>@recipe.TryIt</dd>
+                </dl>
+            </article>
+        }
+    </section>
+
+    <section class="workbench">
+        <div class="panel">
+            <div class="panel-heading">
+                <h2>Document DB</h2>
+                <button class="btn btn-sm btn-outline-secondary" @onclick="CreateArticle" disabled="@busy">Add Article</button>
+            </div>
+            <EditForm Model="articleDraft" OnValidSubmit="CreateArticle">
+                <div class="stack">
+                    <InputText class="form-control" @bind-Value="articleDraft.Title" placeholder="Title" />
+                    <InputText class="form-control" @bind-Value="articleDraft.Category" placeholder="Category" />
+                    <InputTextArea class="form-control" @bind-Value="articleDraft.Body" placeholder="Body" />
+                </div>
+            </EditForm>
+            <div class="result-list">
+                @foreach (var article in articles)
+                {
+                    <div class="result-row">
+                        <strong>@article.Title</strong>
+                        <span>@article.Category</span>
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-heading">
+                <h2>Event Sourcing + CQRS</h2>
+                <button class="btn btn-sm btn-outline-secondary" @onclick="LoadData" disabled="@busy">Refresh</button>
+            </div>
+            <div class="result-list">
+                @foreach (var ticket in tickets)
+                {
+                    <div class="result-row">
+                        <strong>@ticket.Title</strong>
+                        <span>@ticket.Status &middot; @ticket.AssignedTeam &middot; @ticket.NoteCount note(s)</span>
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-heading">
+                <h2>Subscription Messages</h2>
+                <button class="btn btn-sm btn-outline-secondary" @onclick="LoadData" disabled="@busy">Refresh</button>
+            </div>
+            <div class="result-list">
+                @foreach (var message in messages)
+                {
+                    <div class="result-row">
+                        <strong>@message.EventType</strong>
+                        <span>@message.Summary</span>
+                    </div>
+                }
+            </div>
+        </div>
+    </section>
+</div>
+
+@code {
+    private List<MartenRecipeInfo> recipes = [];
+    private List<KnowledgeArticle> articles = [];
+    private List<TicketSummary> tickets = [];
+    private List<IntegrationMessage> messages = [];
+    private ArticleDraft articleDraft = ArticleDraft.Default();
+    private bool busy;
+    private string? error;
+
+    protected override async Task OnInitializedAsync() => await LoadData();
+
+    private async Task LoadData()
+    {
+        try
+        {
+            error = null;
+            recipes = await Http.GetFromJsonAsync<List<MartenRecipeInfo>>("/api/recipes") ?? [];
+            articles = await Http.GetFromJsonAsync<List<KnowledgeArticle>>("/api/articles") ?? [];
+            tickets = await Http.GetFromJsonAsync<List<TicketSummary>>("/api/ticket-summaries") ?? [];
+            messages = await Http.GetFromJsonAsync<List<IntegrationMessage>>("/api/integration-messages") ?? [];
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+    }
+
+    private async Task CreateArticle()
+    {
+        await RunBusy(async () =>
+        {
+            var response = await Http.PostAsJsonAsync(
+                "/api/articles",
+                new UpsertArticleRequest(articleDraft.Title, articleDraft.Category, articleDraft.Body));
+            response.EnsureSuccessStatusCode();
+            articleDraft = ArticleDraft.Default();
+            await LoadData();
+        });
+    }
+
+    private async Task RunTicketFlow()
+    {
+        await RunBusy(async () =>
+        {
+            var opened = await Http.PostAsJsonAsync("/api/tickets", new OpenTicketRequest("Projection lag", "The read side has not caught up yet."));
+            opened.EnsureSuccessStatusCode();
+            var payload = await opened.Content.ReadFromJsonAsync<OpenTicketResponse>();
+            if (payload is null)
+            {
+                throw new InvalidOperationException("Ticket response did not include an id.");
+            }
+
+            var assigned = await Http.PostAsJsonAsync($"/api/tickets/{payload.TicketId}/assign", new AssignTicketRequest("platform"));
+            assigned.EnsureSuccessStatusCode();
+            var noted = await Http.PostAsJsonAsync($"/api/tickets/{payload.TicketId}/notes", new AddTicketNoteRequest("Checked async daemon progress."));
+            noted.EnsureSuccessStatusCode();
+            var closed = await Http.PostAsJsonAsync($"/api/tickets/{payload.TicketId}/close", new CloseTicketRequest("Projection caught up."));
+            closed.EnsureSuccessStatusCode();
+            await LoadData();
+        });
+    }
+
+    private async Task RunBusy(Func<Task> work)
+    {
+        busy = true;
+        error = null;
+        try
+        {
+            await work();
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private sealed record OpenTicketResponse(Guid TicketId);
+
+    private sealed class ArticleDraft
+    {
+        public string Title { get; set; } = string.Empty;
+
+        public string Category { get; set; } = string.Empty;
+
+        public string Body { get; set; } = string.Empty;
+
+        public static ArticleDraft Default() =>
+            new()
+            {
+                Title = "JSON documents",
+                Category = "documents",
+                Body = "Marten stores this article as a JSONB document in PostgreSQL."
+            };
+    }
+}
